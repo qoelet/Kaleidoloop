@@ -1,0 +1,7 @@
+#N canvas 53 114 1050 615 12;
+#X obj 107 171 outlet~ outL-\$1;
+#X obj 107 108 waveplayer~;
+#X obj 267 53 r loadbang-\$1;
+#X obj 107 53 r waveplayer-open;
+#X connect 1 0 0 0;
+#X connect 3 0 1 0;
