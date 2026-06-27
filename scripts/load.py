@@ -17,6 +17,7 @@ and the displaced mode takes the source's slot number.
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -438,6 +439,21 @@ def mirror_modes(modes_dir, target_dir):
     True
     >>> shutil.rmtree(src)
     >>> shutil.rmtree(dst)
+
+    Excludes macOS externals from the mirror:
+
+    >>> src = tempfile.mkdtemp()
+    >>> dst = tempfile.mkdtemp()
+    >>> os.makedirs(os.path.join(src, "6-delay"))
+    >>> open(os.path.join(src, "6-delay", "waveplayer~.pd_linux"), "w").close()
+    >>> open(os.path.join(src, "6-delay", "waveplayer~.pd_darwin"), "w").close()
+    >>> mirror_modes(src, dst)
+    1
+    >>> os.path.exists(os.path.join(dst, "6-delay", "waveplayer~.pd_linux"))
+    True
+    >>> os.path.exists(os.path.join(dst, "6-delay", "waveplayer~.pd_darwin"))
+    False
+    >>> shutil.rmtree(src); shutil.rmtree(dst)
     """
     if not os.path.isdir(target_dir):
         raise ValueError(f"Target directory does not exist: {target_dir}")
@@ -448,9 +464,259 @@ def mirror_modes(modes_dir, target_dir):
     for num, name, src_path in modes:
         dirname = os.path.basename(src_path)
         dst_path = os.path.join(target_dir, dirname)
-        shutil.copytree(src_path, dst_path)
+        shutil.copytree(src_path, dst_path,
+                        ignore=shutil.ignore_patterns("*.pd_darwin"))
 
     return len(modes)
+
+
+def darwin_dest(project_dir):
+    """Return the path where the Mac waveplayer~ external is placed.
+
+    Pre: project_dir is the repo root.
+    Post: returns <project_dir>/pd/lib/waveplayer~.pd_darwin.
+
+    >>> darwin_dest("/repo").replace("\\\\", "/")
+    '/repo/pd/lib/waveplayer~.pd_darwin'
+    """
+    return os.path.join(project_dir, "pd", "lib", "waveplayer~.pd_darwin")
+
+
+def _module_dirs(project_dir):
+    """All mode folders under pd/modes/ and pd/modes/others/."""
+    modes_dir = os.path.join(project_dir, "pd", "modes")
+    others_dir = os.path.join(modes_dir, "others")
+    dirs = []
+    for d in (modes_dir, others_dir):
+        for _num, _name, path in list_modes(d):
+            dirs.append(path)
+    return dirs
+
+
+def mac_ext_sources(project_dir):
+    """Mac-only replacement abstractions for Linux-only externals.
+
+    Live in pd/dev/mac-ext/ (e.g. tanh~.pd, freeverb~.pd). On macOS Pd loads
+    these; on the device the real compiled .pd_linux takes priority, so they do
+    not shadow it.
+    """
+    d = os.path.join(project_dir, "pd", "dev", "mac-ext")
+    if not os.path.isdir(d):
+        return []
+    return [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".pd")]
+
+
+def _symlink_force(src, dest):
+    """Create dest as a relative symlink to src, replacing anything already there."""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.islink(dest) or os.path.exists(dest):
+        os.remove(dest)
+    os.symlink(os.path.relpath(src, os.path.dirname(dest)), dest)
+
+
+def darwin_link_targets(project_dir):
+    """Every path that should symlink to the built waveplayer~.pd_darwin.
+
+    pd/lib (on the search path) plus each mode folder, so a dynamically loaded
+    module finds waveplayer~ locally with no reliance on declared search paths
+    (which Pd can drop when a patch is saved).
+    """
+    return [darwin_dest(project_dir)] + [
+        os.path.join(path, "waveplayer~.pd_darwin") for path in _module_dirs(project_dir)
+    ]
+
+
+def strip_darwin(project_dir):
+    """Remove all macOS-only externals so uploads stay clean.
+
+    Pre: project_dir is the repo root.
+    Post: deletes pd/lib/waveplayer~.pd_darwin and any *.pd_darwin under
+          pd/modes/. Returns the sorted list of removed paths.
+
+    >>> import tempfile, os
+    >>> d = tempfile.mkdtemp()
+    >>> os.makedirs(os.path.join(d, "pd", "lib"))
+    >>> os.makedirs(os.path.join(d, "pd", "modes", "6-delay"))
+    >>> open(darwin_dest(d), "w").close()
+    >>> open(os.path.join(d, "pd", "modes", "6-delay", "waveplayer~.pd_darwin"), "w").close()
+    >>> removed = strip_darwin(d)
+    >>> len(removed)
+    2
+    >>> os.path.exists(darwin_dest(d))
+    False
+    >>> shutil.rmtree(d)
+    """
+    removed = []
+    dest = darwin_dest(project_dir)
+    if os.path.isfile(dest) or os.path.islink(dest):
+        os.remove(dest)
+        removed.append(dest)
+    ext_names = {os.path.basename(s) for s in mac_ext_sources(project_dir)}
+    modes_root = os.path.join(project_dir, "pd", "modes")
+    for root, _dirs, files in os.walk(modes_root):
+        for fn in files:
+            p = os.path.join(root, fn)
+            if fn.endswith(".pd_darwin") or (fn in ext_names and os.path.islink(p)):
+                os.remove(p)
+                removed.append(p)
+    return sorted(removed)
+
+
+def _needs_build(ext_dir, built):
+    """True if the external must be (re)built: artifact missing or a source newer.
+
+    >>> import tempfile, os, time
+    >>> d = tempfile.mkdtemp()
+    >>> built = os.path.join(d, "waveplayer~.pd_darwin")
+    >>> _needs_build(d, built)  # artifact missing
+    True
+    >>> open(built, "w").close()
+    >>> src = os.path.join(d, "waveplayer~.c"); open(src, "w").close()
+    >>> os.utime(built, (time.time() + 10, time.time() + 10))  # artifact newer
+    >>> _needs_build(d, built)
+    False
+    >>> os.utime(src, (time.time() + 20, time.time() + 20))  # source newer
+    >>> _needs_build(d, built)
+    True
+    >>> shutil.rmtree(d)
+    """
+    if not os.path.isfile(built):
+        return True
+    built_mtime = os.path.getmtime(built)
+    for name in ("waveplayer~.c", "waveplayer_dsp.h", "Makefile"):
+        src = os.path.join(ext_dir, name)
+        if os.path.isfile(src) and os.path.getmtime(src) > built_mtime:
+            return True
+    return False
+
+
+def place_darwin(project_dir, force=False):
+    """Build the Mac waveplayer~ external once and symlink it into pd/lib.
+
+    Pre: external/waveplayer/ contains the source and Makefile.
+    Post: builds external/waveplayer/waveplayer~.pd_darwin only if it is
+          missing or out of date (or force=True), then points
+          pd/lib/waveplayer~.pd_darwin at that single canonical build via a
+          relative symlink. Returns (built, dest) where `built` is True if a
+          compile actually ran.
+    Raises RuntimeError if the build fails or produces no artifact.
+    """
+    ext_dir = os.path.join(project_dir, "external", "waveplayer")
+    built_path = os.path.join(ext_dir, "waveplayer~.pd_darwin")
+    did_build = force or _needs_build(ext_dir, built_path)
+    if did_build:
+        result = subprocess.run(["make", "-C", ext_dir], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError("Build failed:\n" + result.stdout + result.stderr)
+    if not os.path.isfile(built_path):
+        raise RuntimeError(f"Build produced no artifact at {built_path}")
+    targets = darwin_link_targets(project_dir)
+    for dest in targets:
+        _symlink_force(built_path, dest)
+    # Mac-only replacement abstractions (tanh~, freeverb~) into each mode folder
+    exts = mac_ext_sources(project_dir)
+    n_ext = 0
+    for module_dir in _module_dirs(project_dir):
+        for src in exts:
+            _symlink_force(src, os.path.join(module_dir, os.path.basename(src)))
+            n_ext += 1
+    return (did_build, len(targets), n_ext)
+
+
+def generate_bench(project_dir):
+    """Regenerate pd/dev/test-bench.pd with a click-to-switch button per mode.
+
+    Pre: pd/modes/ (and pd/modes/others/) hold the mode folders.
+    Post: writes pd/dev/test-bench.pd. Each mode is a labelled button that, on
+          click, dynamically (re)loads that module into a [pd dut] subpatch at
+          slot 1 and routes its audio via throw~/catch~ to dac~. Active modes
+          are one row, others the next. loadbang auto-loads the first mode.
+          Returns (dest_path, n_buttons).
+    """
+    modes_dir = os.path.join(project_dir, "pd", "modes")
+    others_dir = os.path.join(modes_dir, "others")
+    # paths are relative to the bench's own folder (pd/dev), so the bench needs
+    # no [declare] lines (which Pd drops on save). waveplayer~ is found because
+    # load.py mac symlinks it into each mode folder.
+    active = [(f"{n}-{nm}", f"../modes/{n}-{nm}") for n, nm, _ in list_modes(modes_dir)]
+    others = [(f"{n}-{nm}", f"../modes/others/{n}-{nm}") for n, nm, _ in list_modes(others_dir)]
+
+    body, conns, counter = [], [], [0]
+
+    def obj(line):
+        body.append(line)
+        counter[0] += 1
+        return counter[0] - 1
+
+    obj("#X obj 20 14 cnv 15 900 28 empty empty Kaleidoloop\\ playback\\ harness 16 11 0 14 #e0e0e0 #000000 0")
+    lb = obj("#X obj 40 70 loadbang")
+    dspmsg = obj("#X msg 40 110 \\; pd dsp 1")
+    obj("#X obj 250 80 hsl 200 18 0 1 0 0 knob1-1 empty knob1 -2 -9 0 10 #fcfcfc #000000 #000000 0 1")
+    obj("#X obj 250 130 hsl 200 18 0 1 0 0 knob2-1 empty knob2 -2 -9 0 10 #fcfcfc #000000 #000000 0 1")
+    rec = obj("#X obj 540 80 bng 24 250 50 0 empty empty empty 20 7 0 10 #fcfcfc #000000 #000000")
+    recmsg = obj("#X msg 580 80 1 64")
+    skeys = obj("#X obj 540 130 s keys")
+    loadb = obj("#X obj 680 80 bng 24 250 50 0 empty empty empty 20 7 0 10 #fcfcfc #000000 #000000")
+    openp = obj("#X obj 680 120 openpanel")
+    lp = obj("#X obj 680 150 list prepend open")
+    lt = obj("#X obj 680 180 list trim")
+    swo = obj("#X obj 680 210 s waveplayer-open")
+    catch = obj("#X obj 40 560 catch~ tb-out")
+    dac = obj("#X obj 40 600 dac~")
+    obj("#X text 248 62 knobs (0-1)")
+    obj("#X text 536 62 record")
+    obj("#X text 676 62 load wav")
+    obj("#X text 20 252 click a mode to load it (always slot 1):")
+    obj("#X text 20 314 active:")
+    obj("#X text 20 404 others:")
+
+    park_x, park_y, first = 1010, [60], [None]
+
+    def button(label, relpath, x, y):
+        b = obj(f"#X obj {x} {y} bng 26 250 50 0 empty empty {label} 30 8 0 9 #fcfcfc #000000 #000000")
+        m = obj(
+            f"#X msg {park_x} {park_y[0]} \\; pd-dut clear \\; pd-dut obj 40 40 "
+            f"{relpath}/module 1 \\; pd-dut obj 40 90 throw~ tb-out \\; pd-dut "
+            f"connect 0 0 1 0 \\; loadbang-1 bang"
+        )
+        park_y[0] += 22
+        conns.append(f"#X connect {b} 0 {m} 0")
+        if first[0] is None:
+            first[0] = b
+
+    x = 90
+    for label, relpath in active:
+        button(label, relpath, x, 310)
+        x += 132
+    x = 90
+    for label, relpath in others:
+        button(label, relpath, x, 400)
+        x += 132
+
+    # empty [pd dut] subpatch — audio leaves it via throw~, so it needs no wires
+    body.append("#N canvas 0 0 240 200 dut 0")
+    body.append("#X restore 800 560 pd dut")
+    counter[0] += 1
+
+    conns.append(f"#X connect {catch} 0 {dac} 0")
+    conns.append(f"#X connect {catch} 0 {dac} 1")
+    conns.append(f"#X connect {rec} 0 {recmsg} 0")
+    conns.append(f"#X connect {recmsg} 0 {skeys} 0")
+    conns.append(f"#X connect {loadb} 0 {openp} 0")
+    conns.append(f"#X connect {openp} 0 {lp} 0")
+    conns.append(f"#X connect {lp} 0 {lt} 0")
+    conns.append(f"#X connect {lt} 0 {swo} 0")
+    conns.append(f"#X connect {lb} 0 {dspmsg} 0")
+    if first[0] is not None:
+        conns.append(f"#X connect {lb} 0 {first[0]} 0")
+
+    lines = ["#N canvas 60 60 960 680 10;"]
+    lines += [b + ";" for b in body]
+    lines += [c + ";" for c in conns]
+    dest = os.path.join(project_dir, "pd", "dev", "test-bench.pd")
+    with open(dest, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return (dest, len(active) + len(others))
 
 
 def print_status(modes_dir, others_dir):
@@ -563,6 +829,39 @@ def main():
         if missing:
             print(f"Warning: {len(missing)} mode(s) not found on disk: {', '.join(missing)}")
         print_status(MODES_DIR, OTHERS_DIR)
+        return
+
+    if sys.argv[1] == "mac":
+        force = len(sys.argv) > 2 and sys.argv[2] in ("rebuild", "--force", "-f")
+        try:
+            built, n_links, n_ext = place_darwin(PROJECT_DIR, force=force)
+        except RuntimeError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        verb = "Built" if built else "Reused"
+        msg = f"{verb} waveplayer~.pd_darwin; symlinked into pd/lib + {n_links - 1} mode folder(s)"
+        if n_ext:
+            msg += f"; + {n_ext} replacement-abstraction link(s) (tanh~/freeverb~)"
+        print(msg)
+        if not built:
+            print("(source unchanged — use './load mac rebuild' to force a rebuild)")
+        print("Open pd/dev/test-bench.pd in Pd to develop a mode.")
+        return
+
+    if sys.argv[1] == "bench":
+        dest, n = generate_bench(PROJECT_DIR)
+        print(f"Generated {os.path.relpath(dest, PROJECT_DIR)} with {n} mode button(s).")
+        print("Run './scripts/load.py mac' (once) if you haven't, then open it in Pd.")
+        return
+
+    if sys.argv[1] == "hw":
+        removed = strip_darwin(PROJECT_DIR)
+        if removed:
+            print(f"Stripped {len(removed)} macOS external(s):")
+            for p in removed:
+                print(f"  {os.path.relpath(p, PROJECT_DIR)}")
+        else:
+            print("Already clean — no macOS externals present.")
         return
 
     if len(sys.argv) == 3:
