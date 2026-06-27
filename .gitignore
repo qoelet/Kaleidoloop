@@ -1,2 +1,12 @@
 .DS_Store
 pd/sounds/*
+!pd/sounds/.gitkeep
+pd/lib/waveplayer~.pd_darwin
+external/build/
+external/waveplayer/*.pd_darwin
+external/waveplayer/*.o
+external/waveplayer/fidelity/*.wav
+__pycache__/
+waveplayer~.pd_darwin
+pd/modes/**/tanh~.pd
+pd/modes/**/freeverb~.pd
