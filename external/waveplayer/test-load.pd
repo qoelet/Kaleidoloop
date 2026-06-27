@@ -1,0 +1,8 @@
+#N canvas 100 100 480 300 10;
+#X obj 60 120 waveplayer~;
+#X obj 60 80 sig~ 1;
+#X obj 60 170 dac~;
+#X connect 1 0 0 0;
+#X connect 0 0 2 0;
+#X connect 0 0 2 1;
+#X text 60 40 loads waveplayer~ from this dir; should print nothing on error;
