@@ -1,0 +1,7 @@
+#N canvas 0 0 320 180 10;
+#X obj 40 30 inlet~;
+#X obj 40 80 expr~ tanh($v1);
+#X obj 40 130 outlet~;
+#X text 120 78 Mac dev replacement for C&G tanh~ (exact: per-sample tanh).;
+#X connect 0 0 1 0;
+#X connect 1 0 2 0;
